@@ -1,0 +1,3 @@
+## SMR: SAM mapped reads
+
+More info coming soon...
