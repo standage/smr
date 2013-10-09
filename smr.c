@@ -29,16 +29,14 @@ KHASH_MAP_INIT_STR(m32, unsigned)
 
 typedef struct
 {
+  char delim;
   const char *outfile;
   FILE *outstream;
-  const char *idfmt;
-  int noids;
-  unsigned rangestart;
-  unsigned rangeend;
   unsigned numfiles;
 } SmrOptions;
 
 void smr_init_options(SmrOptions *options);
+khash_t(m32) *smr_collect_molids(SmrOptions *options, khash_t(m32) **maps);
 khash_t(m32) *smr_load_file(const char *filename);
 void smr_parse_options(SmrOptions *options, int argc, char **argv);
 void smr_print_matrix(SmrOptions *options, khash_t(m32) **maps);
@@ -68,15 +66,41 @@ int main(int argc, char **argv)
 //------------------------------------------------------------------------------
 // Function implementations
 //------------------------------------------------------------------------------
+khash_t(m32) *smr_collect_molids(SmrOptions *options, khash_t(m32) **maps)
+{
+  unsigned i;
+  khiter_t iter;
+  khash_t(m32) *ids = kh_init(m32);
+  for(i = 0; i < options->numfiles; i++)
+  {
+    for(iter = kh_begin(maps[i]); iter != kh_end(maps[i]); iter++)
+    {
+      if(!kh_exist(maps[i], iter))
+        continue;
+      const char *molid = kh_key(maps[i], iter);
+      khint_t key = kh_get(m32, ids, molid);
+      if(key == kh_end(ids))
+      {
+        int code;
+        key = kh_put(m32, ids, molid, &code);
+        if(!code)
+        {
+          fprintf(stderr, "error: failure storing key '%s'\n", molid);
+          kh_del(m32, ids, key);
+        }
+        else
+          kh_value(ids, key) = 1;
+      }
+    }
+  }
+  return ids;
+}
 
 void smr_init_options(SmrOptions *options)
 {
+  options->delim      = ',';
   options->outfile    = "stdout";
   options->outstream  = stdout;
-  options->idfmt = "gene%05d";
-  options->noids = 0;
-  options->rangestart = 1;
-  options->rangeend = 10;
   options->numfiles   = 0;
 }
 
@@ -127,14 +151,12 @@ void smr_parse_options(SmrOptions *options, int argc, char **argv)
 {
   int opt = 0;
   int optindex = 0;
-  const char *optstr = "hi:no:r:";
+  const char *optstr = "d:ho:";
   const struct option smr_options[] =
   {
+    { "delim",   required_argument, NULL, 'd' },
     { "help",    no_argument,       NULL, 'h' },
-    { "idfmt",   required_argument, NULL, 'i' },
-    { "noids",   no_argument,       NULL, 'n' },
     { "outfile", required_argument, NULL, 'o' },
-    { "idrange", required_argument, NULL, 'r' },
     { NULL,      no_argument,       NULL,  0  },
   };
 
@@ -142,34 +164,24 @@ void smr_parse_options(SmrOptions *options, int argc, char **argv)
       opt != -1;
       opt = getopt_long(argc, argv, optstr, smr_options, &optindex))
   {
-    const char *tok;
     switch(opt)
     {
+      case 'd':
+        if(strcmp(optarg, "\\t") == 0)
+          optarg = "\t";
+        else if(strlen(optarg) > 1)
+        {
+          fprintf(stderr, "warning: string '%s' provided for delimiter, using "
+                  "only '%c'\n", optarg, optarg[0]);
+        }
+        options->delim = optarg[0];
+        break;
       case 'h':
         smr_print_usage(stdout);
         exit(0);
         break;
-      case 'i':
-        options->idfmt = optarg;
-        break;
-      case 'n':
-        options->noids = 1;
-        break;
       case 'o':
         options->outfile = optarg;
-        break;
-      case 'r':
-        tok = strtok(optarg, "-\n");
-        options->rangestart = atoi(tok);
-        tok = strtok(NULL, "-\n");
-        options->rangeend = atoi(tok);
-        if(options->rangestart > options->rangeend)
-        {
-          fprintf(stderr, "error: range %u-%u is invalid, start must be "
-                  "smaller than end\n", options->rangestart, options->rangeend);
-          smr_print_usage(stderr);
-          exit(1);
-        }
         break;
       default:
         fprintf(stderr, "error: unknown option '%c'\n", opt);
@@ -200,34 +212,33 @@ void smr_parse_options(SmrOptions *options, int argc, char **argv)
 
 void smr_print_matrix(SmrOptions *options, khash_t(m32) **maps)
 {
-  unsigned i, j;
-  for(i = options->rangestart; i <= options->rangeend; i++)
+  khiter_t iter;
+  unsigned i;
+  khash_t(m32) *molids = smr_collect_molids(options, maps);
+  for(iter = kh_begin(molids); iter != kh_end(molids); iter++)
   {
-    char molid[MAX_ID_LENGTH];
-    sprintf(molid, options->idfmt, i);
-    if(!options->noids)
-      fprintf(options->outstream, "%s,", molid);
+    if(!kh_exist(molids, iter))
+      continue;
+    const char *molid = kh_key(molids, iter);
 
-    for(j = 0; j < options->numfiles; j++)
+    fprintf(options->outstream, "%s%c", molid, options->delim);
+    for(i = 0; i < options->numfiles; i++)
     {
-      if(j > 0)
-        fputc(',', options->outstream);
+      if(i > 0)
+        fputc(options->delim, options->outstream);
 
-      khash_t(m32) *map = maps[j];
-      khint_t key = kh_get(m32, map, molid);
-
-      if(key == kh_end(map))
-        fputs("0", options->outstream);
+      khint_t key = kh_get(m32, maps[i], molid);
+      if(key == kh_end(maps[i]))
+        fputc('0', options->outstream);
       else
       {
-        unsigned tsareadcount = kh_value(map, key);
-        fprintf(options->outstream, "%u", tsareadcount);
-        char *keystr = (char *)kh_key(map, key);
-        free(keystr);
+        unsigned readcount = kh_value(maps[i], key);
+        fprintf(options->outstream, "%u", readcount);
       }
     }
     fputc('\n', options->outstream);
   }
+  kh_destroy(m32, molids);
 }
 
 void smr_print_usage(FILE *outstream)
@@ -237,26 +248,27 @@ void smr_print_usage(FILE *outstream)
 "each input file) showing the number of reads that map to each sequence.\n\n"
 "Usage: smr [options] sample-1.sam sample-2.sam ... sample-n.sam\n"
 "  Options:\n"
+"    -d|--delim: CHAR         delimiter for output data; default is comma\n"
 "    -h|--help                print this help message and exit\n"
-"    -i|--idfmt: STRING       format of the molecule IDs in printf style;\n"
-"                             default is 'gene%05d'\n"
-"    -n|--noids:              do not print molecule IDs, only the read\n"
-"                             counts; default is to print both, tab-delimited\n"
 "    -o|--outfile: FILE       name of file to which read counts will be\n"
-"                             written; default is terminal (stdout)\n"
-"    -r|--idrange: INT-INT    range of IDs to print; if your data set\n"
-"                             includes 10,000 molecules, then you should use\n"
-"                             '1-10000'; the unrealistic default is '1-10'\n",
+"                             written; default is terminal (stdout)\n",
         outstream);
 }
 
 void smr_terminate(SmrOptions *options, khash_t(m32) **maps)
 {
   unsigned i;
+  khint_t iter;
   for(i = 0; i < options->numfiles; i++)
   {
-    khash_t(m32) *map = maps[i];
-    kh_destroy(m32, map);
+    for(iter = kh_begin(maps[i]); iter != kh_end(maps[i]); iter++)
+    {
+      if(!kh_exist(maps[i], iter))
+        continue;
+      char *molid = (char *)kh_key(maps[i], iter);
+      free(molid);
+    }
+    kh_destroy(m32, maps[i]);
   }
   free(maps);
   fclose(options->outstream);
