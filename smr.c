@@ -23,7 +23,8 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 //------------------------------------------------------------------------------
 // Definitions/prototypes/initializations for data structures, functions, etc.
 //------------------------------------------------------------------------------
-#define MAX_LINE_LENGTH 4096
+#define MAX_LINE_LENGTH 8192
+#define MAX_ID_LENGTH 1024
 KHASH_MAP_INIT_STR(m32, unsigned)
 
 typedef struct
@@ -31,48 +32,84 @@ typedef struct
   const char *outfile;
   FILE *outstream;
   const char *idfmt;
-  const char *infile;
-  FILE *instream;
   int noids;
   unsigned rangestart;
   unsigned rangeend;
+  unsigned numfiles;
 } SmrOptions;
 
 void smr_init_options(SmrOptions *options);
+khash_t(m32) *smr_load_file(const char *filename);
 void smr_parse_options(SmrOptions *options, int argc, char **argv);
+void smr_print_matrix(SmrOptions *options, khash_t(m32) **maps);
 void smr_print_usage(FILE *outstream);
+void smr_terminate(SmrOptions *options, khash_t(m32) **maps);
 
+//------------------------------------------------------------------------------
+// Main method
+//------------------------------------------------------------------------------
+
+int main(int argc, char **argv)
+{
+  SmrOptions options;
+  smr_init_options(&options);
+  smr_parse_options(&options, argc, argv);
+
+  unsigned i;
+  khash_t(m32) **maps = malloc( sizeof(void *) * options.numfiles );
+  for(i = 0; i < options.numfiles; i++)
+    maps[i] = smr_load_file(argv[optind+i]);
+  smr_print_matrix(&options, maps);
+
+  smr_terminate(&options, maps);
+  return 0;
+}
 
 //------------------------------------------------------------------------------
 // Function implementations
 //------------------------------------------------------------------------------
 
-int main(int argc, char **argv)
+void smr_init_options(SmrOptions *options)
 {
+  options->outfile    = "stdout";
+  options->outstream  = stdout;
+  options->idfmt = "gene%05d";
+  options->noids = 0;
+  options->rangestart = 1;
+  options->rangeend = 10;
+  options->numfiles   = 0;
+}
+
+khash_t(m32) *smr_load_file(const char *filename)
+{
+  FILE *instream = fopen(filename, "r");
+  if(instream == NULL)
+  {
+    fprintf(stderr, "error opening file '%s'\n", filename);
+    exit(1);
+  }
+
+  khash_t(m32) *map = kh_init(m32);
   char buffer[MAX_LINE_LENGTH];
-  khash_t(m32) *map;
-  khint_t key;
-  SmrOptions options;
-
-  smr_init_options(&options);
-  smr_parse_options(&options, argc, argv);
-
-  map = kh_init(m32);
-  while(fgets(buffer, MAX_LINE_LENGTH, options.instream) != NULL)
+  while(fgets(buffer, MAX_LINE_LENGTH, instream) != NULL)
   {
     const char *tok = strtok(buffer, "\t\n");
     tok = strtok(NULL, "\t\n");
-    tok = strtok(NULL, "\t\n");
+    int bflag = atoi(tok);
+    if(bflag & 0x4)
+      continue;
 
-    key = kh_get(m32, map, tok);
+    tok = strtok(NULL, "\t\n");
+    khint_t key = kh_get(m32, map, tok);
+
     if(key == kh_end(map))
     {
       int code;
-      const char *tsaid = strdup(tok);
-      key = kh_put(m32, map, tsaid, &code);
+      const char *molid = strdup(tok);
+      key = kh_put(m32, map, molid, &code);
       if(!code)
       {
-        fprintf(stderr, "error: failure storing key '%s'\n", tsaid);
+        fprintf(stderr, "error: failure storing key '%s'\n", molid);
         kh_del(m32, map, key);
       }
       else
@@ -82,48 +119,8 @@ int main(int argc, char **argv)
     kh_value(map, key) = tsareadcount + 1;
   }
 
-  unsigned i;
-  for(i = options.rangestart; i <= options.rangeend; i++) // 209675
-  {
-    char tsaid[32];
-    sprintf(tsaid, options.idfmt, i);
-
-    key = kh_get(m32, map, tsaid);
-    if(key == kh_end(map))
-    {
-      if(options.noids)
-        fputs("0\n", options.outstream);
-      else
-        fprintf(options.outstream, "%s\t0\n", tsaid);
-    }
-    else
-    {
-      unsigned tsareadcount = kh_value(map, key);
-      if(options.noids)
-        fprintf(options.outstream, "%u\n", tsareadcount);
-      else
-        fprintf(options.outstream, "%s\t%u\n", tsaid, tsareadcount);
-      char *keystr = (char *)kh_key(map, key);
-      free(keystr);
-    }
-  }
-
-  kh_destroy(m32, map);
-  fclose(options.outstream);
-  fclose(options.instream);
-  return 0;
-}
-
-void smr_init_options(SmrOptions *options)
-{
-  options->outfile    = "stdout";
-  options->outstream  = stdout;
-  options->idfmt      = "gene%05d";
-  options->infile     = NULL;
-  options->instream   = NULL;
-  options->noids      = 0;
-  options->rangestart = 1;
-  options->rangeend   = 10;
+  fclose(instream);
+  return map;
 }
 
 void smr_parse_options(SmrOptions *options, int argc, char **argv)
@@ -192,25 +189,53 @@ void smr_parse_options(SmrOptions *options, int argc, char **argv)
     }
   }
 
-  int numfiles = argc - optind;
-  if(numfiles != 1)
+  options->numfiles = argc - optind;
+  if(options->numfiles < 1)
   {
-    fprintf(stderr, "expected 1 input file, but found %d\n", numfiles);
+    fputs("expected 1 or more input files\n", stderr);
     smr_print_usage(stderr);
     exit(1);
   }
-  options->infile = argv[optind];
-  options->instream = fopen(options->infile, "r");
-  if(options->instream == NULL)
+}
+
+void smr_print_matrix(SmrOptions *options, khash_t(m32) **maps)
+{
+  unsigned i, j;
+  for(i = options->rangestart; i <= options->rangeend; i++)
   {
-    fprintf(stderr, "error: unable to open input file '%s'\n", options->infile);
-    exit(1);
+    char molid[MAX_ID_LENGTH];
+    sprintf(molid, options->idfmt, i);
+    if(!options->noids)
+      fprintf(options->outstream, "%s,", molid);
+
+    for(j = 0; j < options->numfiles; j++)
+    {
+      if(j > 0)
+        fputc(',', options->outstream);
+
+      khash_t(m32) *map = maps[j];
+      khint_t key = kh_get(m32, map, molid);
+
+      if(key == kh_end(map))
+        fputs("0", options->outstream);
+      else
+      {
+        unsigned tsareadcount = kh_value(map, key);
+        fprintf(options->outstream, "%u", tsareadcount);
+        char *keystr = (char *)kh_key(map, key);
+        free(keystr);
+      }
+    }
+    fputc('\n', options->outstream);
   }
 }
 
 void smr_print_usage(FILE *outstream)
 {
-  fputs("Usage: smr [options] reads.sam\n"
+  fputs("\nSMR: SAM mapped reads\n\n"
+"The input to SMR is 1 or more SAM files. The output is a table (1 column for\n"
+"each input file) showing the number of reads that map to each sequence.\n\n"
+"Usage: smr [options] sample-1.sam sample-2.sam ... sample-n.sam\n"
 "  Options:\n"
 "    -h|--help                print this help message and exit\n"
 "    -i|--idfmt: STRING       format of the molecule IDs in printf style;\n"
@@ -225,3 +250,14 @@ void smr_print_usage(FILE *outstream)
         outstream);
 }
 
+void smr_terminate(SmrOptions *options, khash_t(m32) **maps)
+{
+  unsigned i;
+  for(i = 0; i < options->numfiles; i++)
+  {
+    khash_t(m32) *map = maps[i];
+    kh_destroy(m32, map);
+  }
+  free(maps);
+  fclose(options->outstream);
+}
