@@ -20,6 +20,7 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -45,6 +46,8 @@ umap smr_load_file(std::istream& instream, char delim);
 SmrOptions smr_parse_options(int argc, char **argv);
 void smr_print_matrix(SmrOptions& options, std::vector<umap>& rm2seqPerSample);
 void smr_print_usage(std::ostream& outstream);
+std::vector<std::string>& smr_string_split(const std::string &s, char delim,
+                                           std::vector<std::string> &elems);
 
 //------------------------------------------------------------------------------
 // Main method
@@ -100,11 +103,22 @@ umap smr_load_file(std::istream& instream, char delim)
   std::string buffer;
   while(std::getline(instream, buffer))
   {
-    std::string molid, mapstr;
-    molid  = buffer.substr(0, buffer.find_first_of(delim));
-    mapstr = buffer.substr(buffer.find_first_of(delim) + 1);
-    unsigned readsMapped = std::stoi(mapstr);
-    rm2seq.emplace(molid, readsMapped);
+    if(buffer[0] == '@')
+      continue;
+    
+    std::vector<std::string> tokens;
+    smr_string_split(buffer, '\t', tokens);
+    std::string molid = tokens[2];
+    std::string bflag_str = tokens[1];
+    int bflag = std::stoi(bflag_str);
+    if(bflag & 0x4)
+      continue;
+
+    umap::iterator keyvaluepair = rm2seq.find(molid);
+    if(keyvaluepair == rm2seq.end())
+      rm2seq.emplace(molid, 1);
+    else
+      rm2seq[molid] += 1;
   }
 
   return rm2seq;
@@ -197,7 +211,7 @@ void smr_print_matrix(SmrOptions& options, std::vector<umap>& rm2seqPerSample)
       else
         options.outstream << keyvaluepair->second;
     }
-    options.outstream << std::endl;;
+    options.outstream << std::endl;
   }
 }
 
@@ -212,4 +226,16 @@ void smr_print_usage(std::ostream& outstream)
             << "    -h|--help                print this help message and exit" << std::endl
             << "    -o|--outfile: FILE       name of file to which read counts will be" << std::endl
             << "                             written; default is terminal (stdout)" << std::endl << std::endl;
+}
+
+std::vector<std::string>& smr_string_split(const std::string &s, char delim,
+                                           std::vector<std::string> &elems)
+{
+    std::stringstream ss(s);
+    std::string item;
+    while(std::getline(ss, item, delim))
+    {
+      elems.push_back(item);
+    }
+    return elems;
 }
