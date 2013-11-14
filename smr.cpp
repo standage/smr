@@ -14,228 +14,221 @@ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+
+SMR: SAM mapped reads
+
+The SAM file format encodes the alignment (mapping) of short sequence reads to
+longer molecular sequences. This program reads each entry in the SAM file to
+compute a tally of the number of short reads mapped to each molecule.
+
 */
 
 #include <unistd.h>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <fstream>
-#include <iostream>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-typedef std::unordered_set<std::string> uset;
-typedef std::unordered_map<std::string, unsigned> umap;
+
+/**
+ * @type SmrOptions
+ *
+ * Container and parser for handling command-line options and arguments.
+ */
+typedef struct SmrOptions SmrOptions;
 struct SmrOptions
 {
   char delim;
-  std::string outfile;
-  std::ostream& outstream;
+  const char *outfile;
+  FILE *outstream;
   unsigned numfiles;
-  std::vector<std::string> infiles;
-  SmrOptions(char d, std::string of, std::ostream& os, unsigned nf,
-             std::vector<std::string> infls)
-  : delim(d), outfile(of), outstream(os), numfiles(nf), infiles(infls) {}
-};
-typedef struct SmrOptions SmrOptions;
+  std::vector<const char *> infiles;
 
-uset smr_collect_molids(SmrOptions& options, std::vector<umap>& rm2seqPerSample);
-umap smr_load_file(std::istream& instream, char delim);
-SmrOptions smr_parse_options(int argc, char **argv);
-void smr_print_matrix(SmrOptions& options, std::vector<umap>& rm2seqPerSample);
-void smr_print_usage(std::ostream& outstream);
-std::vector<std::string>& smr_string_split(const std::string &s, char delim,
-                                           std::vector<std::string> &elems);
-
-//------------------------------------------------------------------------------
-// Main method
-//------------------------------------------------------------------------------
-
-int main(int argc, char **argv)
-{
-  SmrOptions options = smr_parse_options(argc, argv);
-
-  std::vector<umap> rm2seqPerSample;
-  for(unsigned i = 0; i < options.numfiles; i++)
+  SmrOptions(int argc, char **argv)
   {
-    std::ifstream ifs (std::string(options.infiles[i]));
-    if(!ifs.is_open())
+    delim = ',';
+    outfile = "stdout";
+
+    char opt;
+    const char *arg;
+    while((opt = getopt(argc, argv, "d:ho:")) != -1)
     {
-      std::cerr << "error opening input file "
-                << options.infiles[i]
-                << std::endl;
+      switch(opt)
+      {
+        case 'd':
+          arg = optarg;
+          if(strcmp(optarg, "\\t") == 0)
+            arg = "\t";
+          else if(strlen(optarg) > 1)
+          {
+            fprintf(stderr, "warning: string '%s' provided for delimiter, using "
+                    "only '%c'\n", optarg, optarg[0]);
+          }
+          delim = arg[0];
+          break;
+        case 'h':
+          usage(stderr);
+          exit(0);
+          break;
+        case 'o':
+          outfile = optarg;
+          break;
+        default:
+          fprintf(stderr, "error: unknown option '%c'\n", opt);
+          usage(stderr);
+          break;
+      }
+    }
+
+    outstream = stdout;
+    if(strcmp(outfile, "stdout") != 0)
+    {
+      outstream = fopen(outfile, "w");
+      if(outstream == NULL)
+      {
+        fprintf(stderr, "error opening file %s", outfile);
+        exit(1);
+      }
+    }
+
+    numfiles = argc - optind;
+    if(numfiles < 1)
+    {
+      fprintf(stderr, "error: expected 1 or more input files\n");
+      usage(stderr);
       exit(1);
     }
-    rm2seqPerSample.push_back(smr_load_file(ifs, options.delim));
-    ifs.close();
+
+    for(unsigned i = 0; i < numfiles; i++)
+      infiles.push_back(argv[optind+i]);
   }
-  smr_print_matrix(options, rm2seqPerSample);
 
-  //options.outstream.close();
-  return 0;
-}
-
-//------------------------------------------------------------------------------
-// Function implementations
-//------------------------------------------------------------------------------
-uset smr_collect_molids(SmrOptions& options, std::vector<umap>& rm2seqPerSample)
-{
-  uset molids;
-  for(std::vector<umap>::iterator ssiter = rm2seqPerSample.begin();
-      ssiter != rm2seqPerSample.end();
-      ssiter++)
+  ~SmrOptions()
   {
-    umap& rm2seq = *ssiter;
-    for(umap::iterator iter = rm2seq.begin(); iter != rm2seq.end(); iter++)
+    fclose(outstream);
+  }
+
+  void usage(FILE *outstream)
+  {
+    fprintf(outstream, "\nSMR: SAM mapped reads\n\n"
+"The input to SMR is 1 or more SAM files. The output is a table (1 column for\n"
+"each input file) showing the number of reads that map to each molecule.\n\n"
+"Usage: smr [options] sample-1.sam sample-2.sam ... sample-n.sam\n"
+"  Options:\n"
+"    -d|--delim: CHAR         delimiter for output data; default is comma\n"
+"    -h|--help                print this help message and exit\n"
+"    -o|--outfile: FILE       name of file to which read counts will be\n"
+"                             written; default is terminal (stdout)\n\n");
+  }
+};
+
+
+/**
+ * @type ReadTally
+ *
+ * This class is an instance of an unordered map. Each key is a unique ID
+ * corresponding to a molecule, and the value is the number of reads mapped to
+ * that molecule.
+ */
+#define MAX_LINE_LENGTH 2048
+typedef struct ReadTally ReadTally;
+struct ReadTally : public std::unordered_map<std::string, unsigned>
+{
+  FILE *instream;
+  ReadTally(const char *infilename)
+  {
+    instream = fopen(infilename, "r");
+    if(instream == NULL)
     {
-      molids.emplace(iter->first);
+      fprintf(stderr, "error opening file %s\n", infilename);
+      exit(1);
     }
-  }
-  return molids;
-}
 
-umap smr_load_file(std::istream& instream, char delim)
-{
-  umap rm2seq;
-
-  std::string buffer;
-  while(std::getline(instream, buffer))
-  {
-    if(buffer[0] == '@')
-      continue;
-    
-    std::vector<std::string> tokens;
-    smr_string_split(buffer, '\t', tokens);
-    std::string molid = tokens[2];
-    std::string bflag_str = tokens[1];
-    int bflag = std::stoi(bflag_str);
-    if(bflag & 0x4)
-      continue;
-
-    umap::iterator keyvaluepair = rm2seq.find(molid);
-    if(keyvaluepair == rm2seq.end())
-      rm2seq.emplace(molid, 1);
-    else
-      rm2seq[molid] += 1;
-  }
-
-  return rm2seq;
-}
-
-SmrOptions smr_parse_options(int argc, char **argv)
-{
-  char delim = ',';
-  std::string outfile = "stdout";
-
-  char opt;
-  const char *arg;
-  while((opt = getopt(argc, argv, "d:ho:")) != -1)
-  {
-    switch(opt)
+    char buffer[MAX_LINE_LENGTH];
+    while(fgets(buffer, MAX_LINE_LENGTH, instream) != NULL)
     {
-      case 'd':
-        arg = optarg;
-        if(strcmp(optarg, "\\t") == 0)
-          arg = "\t";
-        else if(strlen(optarg) > 1)
-        {
-          std::cerr << "warning: string '"
-                    << arg
-                    << "' provided for delimiter, using only '"
-                    << arg[0]
-                    << "'"
-                    << std::endl;
-        }
-        delim = arg[0];
-        break;
-      case 'h':
-        smr_print_usage(std::cout);
-        exit(0);
-        break;
-      case 'o':
-        outfile = optarg;
-        break;
-      default:
-        fprintf(stderr, "error: unknown option '%c'\n", opt);
-        smr_print_usage(std::cerr);
-        break;
-    }
-  }
+      if(buffer[0] == '@')
+        continue;
 
-  std::ofstream outfilestream;
-  bool usestdout = (outfile.compare(std::string("stdout")) == 0);
-  if(!usestdout)
-    outfilestream.open(outfile, std::ios::out);
-  std::ostream& outstream = (usestdout ? std::cout : outfilestream);
+      char *tok = strtok(buffer, "\t\n");
+      tok = strtok(NULL, "\t\n");
+      int bflag = atoi(tok);
+      if(bflag & 0x4)
+        continue;
 
-  unsigned numfiles = argc - optind;
-  if(numfiles < 1)
-  {
-    std::cerr << "expected 1 or more input files" << std::endl;
-    smr_print_usage(std::cerr);
-    exit(1);
-  }
+      tok = strtok(NULL, "\t\n");
+      std::string molid (tok);
 
-  std::vector<std::string> infiles;
-  for(unsigned i = 0; i < numfiles; i++)
-  {
-    int ind = optind + i;
-    std::string filename (argv[ind]);
-    infiles.push_back(filename);
-  }
-
-  return SmrOptions (delim, outfile, outstream, numfiles, infiles);
-}
-
-void smr_print_matrix(SmrOptions& options, std::vector<umap>& rm2seqPerSample)
-{
-  uset molids = smr_collect_molids(options, rm2seqPerSample);
-  for(uset::iterator iter = molids.begin(); iter != molids.end(); iter++)
-  {
-    std::string molid = *iter;
-    options.outstream << molid << options.delim;
-
-    for(std::vector<umap>::iterator sampleiter = rm2seqPerSample.begin();
-        sampleiter != rm2seqPerSample.end();
-        sampleiter++)
-    {
-      if(sampleiter != rm2seqPerSample.begin())
-        options.outstream << options.delim;
-
-      umap rm2seq = *sampleiter;
-      umap::const_iterator keyvaluepair = rm2seq.find(molid);
-      if(keyvaluepair == rm2seq.end())
-        options.outstream << '0';
+      ReadTally::iterator kvpair = this->find(molid);
+      if(kvpair == this->end())
+        this->emplace(molid, 1);
       else
-        options.outstream << keyvaluepair->second;
+        kvpair->second += 1;
     }
-    options.outstream << std::endl;
   }
-}
 
-void smr_print_usage(std::ostream& outstream)
-{
-  outstream << std::endl << "SMR: SAM mapped reads" << std::endl << std::endl
-            << "The input to SMR is 1 or more SAM files. The output is a table (1 column for" << std::endl
-            << "each input file) showing the number of reads that map to each sequence." << std::endl << std::endl
-            << "Usage: smr [options] sample-1.sam sample-2.sam ... sample-n.sam" << std::endl
-            << "  Options:" << std::endl
-            << "    -d|--delim: CHAR         delimiter for output data; default is comma" << std::endl
-            << "    -h|--help                print this help message and exit" << std::endl
-            << "    -o|--outfile: FILE       name of file to which read counts will be" << std::endl
-            << "                             written; default is terminal (stdout)" << std::endl << std::endl;
-}
+  ~ReadTally() { fclose(instream); }
+};
 
-std::vector<std::string>& smr_string_split(const std::string &s, char delim,
-                                           std::vector<std::string> &elems)
+
+/**
+ * @class ReadTallyMatrix
+ *
+ * This class is an instance of a vector, where the vector elements are
+ * ReadTally objects (described above). Each row in the matrix corresponds to a
+ * molecule, and each column corresponds to one of the input files. The order of
+ * the columns is the same as the order of the input files.
+ */
+typedef struct ReadTallyMatrix ReadTallyMatrix;
+struct ReadTallyMatrix : public std::vector<ReadTally>
 {
-    std::stringstream ss(s);
-    std::string item;
-    while(std::getline(ss, item, delim))
+  ReadTallyMatrix(std::vector<const char *>& infiles)
+  {
+    for(auto& infilename : infiles)
+      this->emplace_back(infilename);
+  }
+
+  void print(FILE *outstream, char delim)
+  {
+    std::unordered_set<std::string> molids;
+    for(auto& readTally : *this)
     {
-      elems.push_back(item);
+      for(auto& kvpair : readTally)
+        molids.emplace(kvpair.first);
     }
-    return elems;
+    
+    for(auto& molid : molids)
+    {
+      fprintf(outstream, "%s%c", molid.c_str(), delim);
+    
+      bool printdelim = false;
+      for(auto& readTally : *this)
+      {
+        if(printdelim)
+          fputc(delim, outstream);
+        else
+          printdelim = true;
+    
+        ReadTally::const_iterator kvpair = readTally.find(molid);
+        if(kvpair == readTally.end())
+          fputc('0', outstream);
+        else
+          fprintf(outstream, "%u", kvpair->second);
+      }
+      fprintf(outstream, "\n");
+    }
+  }
+};
+
+
+// Main method
+int main(int argc, char **argv)
+{
+  SmrOptions options(argc, argv);
+  ReadTallyMatrix readTalliesPerSample(options.infiles);
+  readTalliesPerSample.print(options.outstream, options.delim);
+  return 0;
 }
